@@ -11,7 +11,7 @@ func WithLocalCORS(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+			w.WriteHeader(http.StatusNoContent) //204
 			return
 		}
 		next.ServeHTTP(w, r)
