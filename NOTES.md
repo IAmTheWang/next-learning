@@ -1,0 +1,112 @@
+# 学习笔记
+
+跟 [PLAN.md](./PLAN.md) 不是一个东西——PLAN.md 是项目周期计划，这份是过程中遇到的具体概念/踩坑记录，按主题整理，方便复习。
+
+## Go 后端基础
+
+### `go run` 不是"语法糖"，是编译+运行+清理的便捷封装
+
+**误解**：以为 `go run main.go` 直接执行了你写的代码，跟"语法糖"（语言层面的简写）是一回事。
+
+**实际情况**：`go run` 是 Go 工具链的一个命令，做的事情是：
+
+```
+go run main.go
+  ≈ 编译出一个临时二进制文件
+  → 启动一个"中间人"进程去执行这个临时文件
+  → 执行完/被打断后，删掉这个临时文件
+```
+
+它简化的是"编译+运行+清理"这一套**操作流程**，不是简化代码写法本身——所以准确说法是"便捷开发工具"，不是"语法糖"。
+
+**为什么这个区别很重要（真实踩坑）**：`go run` 会多出一个"中间人进程"（go 工具自己），你的真正程序是这个中间人启动的子进程：
+
+```
+go run main.go
+   ↓
+中间人进程（go 工具自己，没有任何自定义信号处理逻辑）
+   ↓
+真正的程序（子进程，写了 signal.NotifyContext 逻辑）
+```
+
+按 `Ctrl+C` 时，操作系统把 `SIGINT` 同时发给这两个进程：
+- 中间人没有自定义处理逻辑，收到信号立刻死掉，终端马上把控制权还给你（提示符瞬间出现）
+- 真正的程序还在按你写的优雅关闭逻辑收尾，但这时候终端已经不再"陪着"它了，它打的日志你很可能看不到，或者看到时已经错过了时机
+
+**教训**：想测试跟"程序自己收到信号/怎么退出"相关的行为，不要用 `go run`，要先 `go build` 出二进制再直接执行：
+
+```bash
+go build -o bin/server .
+./bin/server
+# 这时候只有一个进程，终端会一直陪着它，Ctrl+C 后能看到完整的收尾日志
+```
+
+### OS 信号（Signal）是什么
+
+你在终端按 `Ctrl+C`，不是往程序的输入里"打字"，是操作系统直接给这个进程"发通知"，不经过程序的正常逻辑：
+
+```
+你按 Ctrl+C
+   ↓
+操作系统给这个进程发 SIGINT 信号
+   ↓
+默认行为：进程立刻终止（除非程序自己拦截了这个信号）
+```
+
+常见的几种信号：
+
+| 信号 | 谁会发 | 能不能被拦截 |
+|---|---|---|
+| `SIGINT` | 终端 `Ctrl+C` | 能 |
+| `SIGTERM` | `kill <pid>`、`docker stop`、K8s 下线 Pod | 能 |
+| `SIGKILL` | `kill -9` | **不能**，操作系统直接强杀，程序没有机会收尾 |
+
+`signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)` 做的事，就是"拦截" SIGINT/SIGTERM 的默认行为（立刻终止），转换成 `context` 的取消信号，让程序自己决定怎么收尾。SIGKILL 拦不住，这是操作系统设计上留的"最后一道保险"——防止程序耍赖不肯退出。
+
+### `context` 是什么、`signal.NotifyContext` 具体做了什么
+
+如果不用 `signal.NotifyContext`，等价的手写版本是这样（帮助理解它内部做了什么）：
+
+```go
+sigCh := make(chan os.Signal, 1)
+signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM) // 让系统把信号投进这个"信箱"
+ctx, cancel := context.WithCancel(context.Background())
+
+go func() {
+    <-sigCh   // 死等信箱有信
+    cancel()  // 收到信就手动取消 ctx
+}()
+```
+
+`signal.NotifyContext` 把这一整套打包成一次函数调用，返回：
+- `ctx`：一个"一旦收到信号就会被取消"的 context，取消后 `ctx.Done()` 这个 channel 会关闭，所有卡在 `<-ctx.Done()` 的代码会被唤醒
+- `stop`：清理函数，停止对信号的监听，`defer stop()` 保证资源不泄漏
+
+**为什么要用 context 这套机制，而不是直接操作信号 channel**：因为 Go 里"数据库查询""HTTP 请求""服务器关闭"等等几乎所有可能阻塞的操作，都统一接受一个 `context` 参数来表达"取消"。把系统信号翻译成 context 后，这些函数不需要额外写代码就能对"程序要关闭了"这件事做出反应。
+
+### `time` 包 / 超时是什么时候用的
+
+跟前端 `fetch` 配 `AbortController` 设置请求超时是同一个思路，只是发生在服务端。数据库查询、调外部服务的地方都该包一层超时，防止"下游卡住 = 我也无限期卡住"：
+
+```go
+pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+defer cancel()
+```
+
+`2*time.Second` 就是"2秒"的写法（`time.Second` 是"1秒"这个时长单位的常量）。
+
+## curl / 终端相关
+
+### curl 不是"程序员专用测试工具"，是通用的命令行 HTTP 客户端
+
+用途包括但不限于：本地开发调试、定时任务里的健康检查、CI/CD 部署后的验证脚本、生产环境排查问题。
+
+### 怎么让 curl "一直请求"
+
+curl 本身只发一次请求就结束，"一直请求"是靠 shell 的循环语法：
+
+```bash
+while true; do curl -s localhost:8090/health; echo; sleep 1; done
+```
+
+直接在终端里敲这一整行回车执行即可，不需要写成文件。`Ctrl+C` 停止这个循环本身。
