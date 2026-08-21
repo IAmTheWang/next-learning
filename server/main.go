@@ -28,9 +28,22 @@ import (
 	"time"
 
 	// 下面两个是本项目自己写的包，路径前缀 "next-learning/server" 来自 go.mod 里的 module 名。
+	"next-learning/server/internal/bff"
 	"next-learning/server/internal/db"
 	"next-learning/server/internal/handlers"
 )
+
+// mockUpstreamHandler simulates one downstream service with a fixed
+// artificial latency. This exists purely so /bff/aggregate has something
+// real to fan out to without standing up three separate services — same
+// spirit as WithLocalCORS below, demo-only scaffolding, not production code.
+func mockUpstreamHandler(delay time.Duration, body string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(delay)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(body))
+	}
+}
 
 func main() {
 	// 1. 读取数据库连接字符串。
@@ -63,6 +76,7 @@ func main() {
 
 	// 4. 创建一个路由器（Go 1.22+ 的标准库自带 mux，不需要额外引入 gin/chi 之类的框架）。
 	mux := http.NewServeMux()
+	addr := ":8090"
 
 	// 5. 注册第一个路由：GET /health
 	//    "GET /health" 这种"方法+路径"写法是 Go 1.22 才支持的新语法，
@@ -87,11 +101,44 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "go-api"})
 	})
 
+	// 5.5 BFF 并发聚合 demo：3 个模拟上游服务（各 150ms 延迟）+
+	//     并发版 /bff/aggregate 和串行版 /bff/aggregate-serial，
+	//     方便直接 curl 两个接口对比延迟差异。
+	const upstreamDelay = 150 * time.Millisecond
+	mux.HandleFunc("GET /mock/user", mockUpstreamHandler(upstreamDelay, `{"id":1,"name":"demo-user"}`))
+	mux.HandleFunc("GET /mock/order", mockUpstreamHandler(upstreamDelay, `{"id":2,"item":"demo-order"}`))
+	mux.HandleFunc("GET /mock/stock", mockUpstreamHandler(upstreamDelay, `{"id":3,"qty":42}`))
+
+	upstreams := bff.Upstreams{
+		User:  "http://localhost" + addr + "/mock/user",
+		Order: "http://localhost" + addr + "/mock/order",
+		Stock: "http://localhost" + addr + "/mock/stock",
+	}
+
+	mux.HandleFunc("GET /bff/aggregate", func(w http.ResponseWriter, r *http.Request) {
+		result, err := bff.Aggregate(r.Context(), http.DefaultClient, 300*time.Millisecond, upstreams)
+		if err != nil {
+			w.WriteHeader(http.StatusGatewayTimeout)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(result)
+	})
+
+	mux.HandleFunc("GET /bff/aggregate-serial", func(w http.ResponseWriter, r *http.Request) {
+		result, err := bff.AggregateSerial(r.Context(), http.DefaultClient, time.Second, upstreams)
+		if err != nil {
+			w.WriteHeader(http.StatusGatewayTimeout)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(result)
+	})
+
 	// 6. 组装 http.Server。
 	//    Handler 不是直接传 mux，而是 handlers.WithLocalCORS(mux)——
 	//    这是"中间件"的写法：用一个函数把 mux 包起来，
 	//    所有请求会先经过 WithLocalCORS 加 CORS 响应头，再被转发给 mux 做真正的路由匹配。
-	addr := ":8090"
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: handlers.WithLocalCORS(mux),

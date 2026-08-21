@@ -452,3 +452,514 @@ while true; do curl -s localhost:8090/health; echo; sleep 1; done
 ```
 
 直接在终端里敲这一整行回车执行即可，不需要写成文件。`Ctrl+C` 停止这个循环本身。
+
+## BFF 并发聚合（errgroup + context）—— 面试项目实现
+
+这是真实落地进本项目的代码，不是纸面上的 PoC 片段，而且已经打通了完整的 Next.js + Go 双层架构（跟 `middleware.go` 注释里说的"Next.js BFF 服务端到服务端调用 Go 服务"是同一个模式）：
+
+- [`internal/bff/aggregate.go`](server/internal/bff/aggregate.go)：核心并发聚合逻辑
+- [`internal/bff/aggregate_test.go`](server/internal/bff/aggregate_test.go)：单元测试 + benchmark
+- [`main.go:103-135`](server/main.go)：Go 侧真实路由 `/bff/aggregate`（并发）与 `/bff/aggregate-serial`（串行），`go run .` 之后可以直接 curl
+- [`web/app/api/bff-aggregate/route.ts`](web/app/api/bff-aggregate/route.ts)：Next.js 侧的 Route Handler，服务端并发调用上面两个 Go 接口并各自计时，浏览器只跟这个 route 打交道（同源，不涉及 CORS）
+- [`web/app/bff-demo/page.tsx`](web/app/bff-demo/page.tsx)：一个可视化对比页面，点"运行对比"按钮，实时显示并发版 vs 串行版的真实耗时和百分比差异；首页（`web/app/page.tsx`）也加了入口链接
+
+### 和最初那版 PoC 代码相比，做了两个关键调整
+
+1. **框架从 Gin 换成了标准库 `net/http`**——因为这个项目从一开始就是纯标准库 mux（见 `main.go` 里 `http.NewServeMux()`），没有引入 Gin。如果简历上写"Go / Gin / errgroup"，但代码库里根本没有 Gin，面试官一旦细问或要求过一遍代码就会露馅。所以简历这一行建议改成 **"Go（标准库 net/http）/ errgroup"**，除非你在别的项目里确实用过 Gin，那是另一码事，不要混在同一段描述里。
+2. **`errgroup` 补上了 panic recovery**——最初的 PoC 代码问答里已经指出"errgroup 不会自动 recover panic"这个坑，这次直接把它变成了代码而不是停留在回答里：`aggregate.go` 里的 `safeGo()` 包了一层 `defer recover()`，把某个上游 panic 转换成普通 error，不会拖垮整个进程。测试 `TestSafeGoRecoversPanic` 直接验证了这一点。
+
+### 用真实 benchmark 数字替换"约 60%+"这种估算
+
+```bash
+go test ./internal/bff/... -bench=. -benchtime=20x -run=^$
+```
+
+在这台机器（Apple M5）上，3 路上游各 150ms 延迟的场景下跑出来的真实数字：
+
+```
+BenchmarkAggregateSerial-10      20    453998433 ns/op   # ≈454ms/次
+BenchmarkAggregateParallel-10    20    151346025 ns/op   # ≈151ms/次
+```
+
+454ms → 151ms，**延迟降低约 66.7%**，比最初简历里写的"60%+"还要好看一点，而且是真跑出来的、可复现的数字，不是估算——面试被追问"这个数字怎么来的"，可以直接甩一句 `go test -bench=.` 现场跑给对方看。
+
+同时接进了两个真实路由，可以直接对比：
+
+```bash
+go run .
+curl -w '\n%{time_total}s\n' localhost:8090/bff/aggregate         # 并发版，≈0.15-0.2s
+curl -w '\n%{time_total}s\n' localhost:8090/bff/aggregate-serial  # 串行版，≈0.45-0.5s
+```
+
+### 简历技术描述（修订版）
+
+> **BFF 层并发聚合 API（Go 标准库 net/http / errgroup）**
+> 针对多上游服务调用场景下的接口响应延迟问题，设计并实现基于 `errgroup` + `context` 的并发聚合方案：将原本串行调用 3 个上游 API 的 I/O 密集型逻辑改造为 goroutine 并发执行，通过 `errgroup.WithContext` 实现"一处失败、全局取消"的错误传播机制，并利用 `context.WithTimeout` 对整体聚合请求设定统一超时边界。相比串行方案，在 3 路上游、单路 150ms 延迟的 benchmark 场景下，端到端延迟从 ≈454ms 降至 ≈151ms，降低约 **66.7%**（`go test -bench=.` 可复现）。方案同时用单元测试验证了 panic 恢复（防止单个上游异常拖垮整个进程）与超时熔断（context 取消能让请求快速失败而非傻等）两个生产级并发安全要点。
+
+### 面试问答演练（已对照真实代码校准）
+
+**Q1：如果某个上游 goroutine panic 了，会发生什么？如何处理？**
+`errgroup` 本身不会自动 recover panic——一个 goroutine panic 会直接让整个进程崩溃。本项目里 `aggregate.go` 的 `safeGo()` 函数专门包了一层 `defer recover()`，把 panic 转换成普通 error 交给 `g.Wait()`，测试 `TestSafeGoRecoversPanic` 直接验证：故意让一个任务 panic，断言 `g.Wait()` 拿到的是 error 而不是进程崩溃。
+
+**Q2：`context.WithTimeout` 超时后，那些还在跑的 goroutine 会立刻停止吗？**
+不会立刻停。`context` 取消只是关闭 `ctx.Done()` channel，通知 goroutine "该退出了"，真正能不能停下来取决于内部有没有用支持 context 的调用。本项目里 `fetch()` 用的是 `http.NewRequestWithContext`，所以底层网络连接会在超时那一刻真正被中断——这也是 `TestAggregate_TimeoutCancelsSiblings` 这个测试要专门验证的点：给 3 个 200ms 慢的上游只留 20ms 预算，断言真实耗时远小于 200ms（证明是靠 context 取消提前失败，不是傻等上游自然结束）。
+
+**Q3：这种并发聚合模式下，goroutine 泄露最常见的场景是什么？怎么规避？**
+最常见的场景是某个 `g.Go` 里的调用没有正确响应 `ctx.Done()`（不支持 context 的阻塞调用、无缓冲 channel 发送卡住等），即使 `g.Wait()` 已经因超时提前返回，那个 goroutine 依然挂着。规避方式：① 所有 I/O 强制走 context-aware 的 API（本项目全程用 `http.NewRequestWithContext`）；② 用 pprof 的 goroutine profile 观测生产环境的 goroutine 数量趋势。
+
+**Q4：Goroutine 本身的开销有多大？是不是并发路数越多越好？**
+单个 goroutine 初始栈约 2KB，开销远小于 OS 线程，但不是零成本——尤其是每一路都带来独立网络连接、GC 压力和调度负担。本项目场景是"固定 3 路上游"，直接开 3 个 goroutine 没问题；如果扇出路数不固定、可能很大（比如遍历一个不定长列表逐条请求），就要用 `errgroup.SetLimit(n)` 限制并发上限，防止打爆下游或本机连接数——这是当前代码**没有覆盖**的场景，如果面试官顺着问下去，要老实说"当前实现是固定 3 路，没有做限流，量大就得加 `SetLimit`"，不要不懂装懂。
+
+## AbortController / fetch —— 前端这边的"取消机制"，对应 Go 的 `context`
+
+### AbortController 是谁封装的
+
+浏览器（以及 Node.js）自己内置的，不是第三方库、也不是某个程序员写的 JS 代码。它跟 `fetch`、`document`、`window`、`setTimeout` 是同一级别的东西——浏览器厂商（Chrome/Firefox/Safari）在引擎底层用 C++ 实现好，暴露一个接口给 JS 直接用。不需要 `import`、不需要装 npm 包，因为它是 **WHATWG**（浏览器厂商联合组成的标准组织）制定的官方标准的一部分，所有浏览器都必须内置实现。
+
+### 为什么要拆成 `controller` 和 `controller.signal` 两半
+
+`AbortController` 本体拥有"发起取消"的权力——调用 `controller.abort()` 才能触发取消。如果把整个 `controller` 传给 `fetch`，`fetch` 内部理论上也能自己调用 `abort()`，把不该由它决定的事情也决定了。所以设计上把权力拆开：
+
+|            | `controller` 本体            | `controller.signal`                  |
+| ---------- | ----------------------------- | ------------------------------------- |
+| 谁拿着     | 发起取消的一方（自己的代码）   | 传给需要"被取消"的操作（比如 `fetch`）|
+| 能干什么   | 有权按下 `abort()`             | 只能"听"，不能主动触发取消            |
+| 类比       | 遥控器                         | 遥控器发出的红外线信号                |
+
+**员工/老板类比**：`fetch` 是员工，干活干到一半，自己没有权力说"老子不干了"——叫停的权力只在老板手里，这权力本身就是 `controller`；员工能做的是"听到老板喊停之后主动停下来"，这个"能听懂命令并做出反应"的能力就是 `signal`。员工手里没戴"对讲机"（没接 `signal`）的话，老板喊破喉咙也听不见，会一直闷头干到自然结束——这正是"老库不支持 context/signal"时的处境。
+
+### 为什么叫 "signal"
+
+这个词照搬现实里"信号"的概念——红绿灯、消防警报铃：一方广播出状态变化，所有"正在监听"的人自己决定要不要反应，发信号的人不用挨个通知每一个人。`fetch` 拿到 `signal` 后，官方实现里主动加了一个监听（`signal.addEventListener('abort', ...)`），一旦触发就中断底层网络连接——这段监听逻辑是浏览器帮你写好的，自己写的一个不接 `signal` 的 `setTimeout` 包装函数，就不会被取消，因为没人帮它写那段监听逻辑。
+
+### 和 Go 的 `ctx.Done()` 完全对得上
+
+| JS | Go | 作用 |
+| --- | --- | --- |
+| `AbortController` 本体 | `context.WithCancel(...)` 返回的东西 | 拥有"发起取消"权力的一方 |
+| `controller.abort()` | 调用 `cancel()`（或超时自动触发） | 按下取消开关 |
+| `controller.signal` | `ctx` 本身（传给下游函数的那个） | 只读的"监听凭证" |
+| `signal.addEventListener('abort', ...)` | `select { case <-ctx.Done(): ... }` | 主动监听"信号响了没" |
+| `signal.aborted`（布尔值） | `ctx.Err()`（非 nil 就是已取消/超时） | 查一下现在触发了没 |
+
+一句话总结：`signal` 这个名字本身就在提示——它是"广播出去的状态"，不是"强制命令"，不会主动打断任何代码，只是安静待在那儿，谁写了代码去"听"，谁才会反应。
+
+## fetch 是谁写的、fetch vs axios
+
+### fetch 分两层
+
+- **标准/规范层**：由 WHATWG（Google、Mozilla、Apple、Microsoft 等厂商组成）制定"fetch 该长什么样"的规范文档，类似"红绿灯该是几种颜色"这种交通规则。
+- **实现层**：每家浏览器厂商照着规范用自己的引擎语言（大多 C++）真正写出来——Chrome/Edge 是 Google 的 V8+Blink 团队写的，Firefox 是 Mozilla 写的，Safari 是 Apple 写的，Node.js 从 v18 开始内置了基于 `undici` 库的实现。所以在 Chrome 和 Firefox 里敲同一行 `fetch(...)`，跑的是两家公司各自写的代码，但因为都照着同一份规范，JS 代码不用改，行为看起来一致。
+
+### fetch vs axios 对比
+
+| | fetch | axios |
+| --- | --- | --- |
+| 出身 | 浏览器/Node 官方内置，不用装包 | 第三方 npm 库（Matt Zabriskie 最早写的，后转社区维护） |
+| 请求失败判定 | 大坑：只有网络层彻底失败（断网/DNS 挂了）才 reject；404/500 这类 fetch 认为"请求本身成功"，不会自动 reject，得自己判断 `response.ok` | 自动把 4xx/5xx 当 error 抛出来，更符合直觉 |
+| 好用的特性 | 原生支持 `AbortController`、streaming，Next.js 官方还给它加了缓存能力 | 自带请求/响应拦截器、自动 JSON 序列化、超时配置更简单 |
+
+新项目/轻量项目现在（2026）主流建议优先用原生 `fetch`；老项目/企业级项目大量还在用 `axios`，主要是历史惯性 + 拦截器（"所有请求自动带 token"、"所有 401 自动跳登录页"这类全局逻辑）比原生 fetch 顺手。
+
+### 时间线：为什么 axios 感觉"火了很久"
+
+- **2017 年之前，`AbortController`/`signal` 压根不存在**：Firefox 2017 年底、Chrome 2018 年、Safari 2019 年才落地。在这之前 fetch 发出去的请求真的没法取消——2015 年 fetch 规范刚出来时只顾着用 Promise 替代回调，没设计"取消"，业内骂了两年才补上。（但更早的 `XMLHttpRequest`，约 2005-2006 年就有，自带专属的 `.abort()` 方法，只是写法啰嗦。）
+- **axios 约 2014 年底发布，2015-2016 年火起来**，到 2026 年已经 10+ 年——它出生时正好补上 fetch 当年一堆坑：自动 JSON 转换、4xx/5xx 自动抛错、拦截器、自己的 `CancelToken` 取消机制（比 fetch 官方拿到 `AbortController` 支持早了好几年）。
+- **Node.js 原生 `fetch` 直到 2022 年 Node 18 才出现**，这之前 Node 后端场景下 `axios`（或更早的 `request` 库）几乎是唯一选择长达将近 8 年，进一步巩固了它的地位。
+- 现在 axios 依然大量存在，主要不是技术上还领先（fetch 已经追平甚至反超大部分场景），而是十年积累的存量代码 + 拦截器这类场景依然更顺手，企业级项目缺乏动力迁移。
+
+## panic / recover / defer 机制精讲
+
+### `panic(...)` 是干什么的：占坑代码里的用法
+
+`panic(...)` 是 Go 内置的"立刻中断当前执行、开始退栈"机制，类似 JS 的 `throw`，但默认更暴力——没人 `recover()` 的话，整个进程直接崩溃退出，并打印传进去的值 + 调用栈。[`server/exercises/concurrency101/01_waitgroup.go`](server/exercises/concurrency101/01_waitgroup.go) 里的 `panic("TODO: implement me")` 就是故意用它当"占坑符"：比起 `return nil`（会让测试报出"结果不对"这种含糊错误），`panic` 一调用就炸出清楚的文字 + 精确的文件行号，消除"没实现"和"实现错了"之间的歧义。
+
+### `defer` 到底是不是"立即执行函数"
+
+关键看**结尾有没有紧跟着的 `()`**：
+
+```go
+func() { ... }()      // 结尾有 ()，这是"定义完立刻调用"，IIFE
+g.Go(func() { ... })  // 结尾没有 ()，只是把函数值当参数传出去，由 g.Go 自己决定何时调
+```
+
+`defer func(){...}()` 里那对 `()` 让它在语法上确实是一次函数调用；但 `defer` 关键字劫持了这次调用的**执行时机**——登记的动作立刻发生，真正执行被推迟到外层函数返回前(不管是正常 `return` 还是 panic 退栈)。
+
+`defer` 后面也不是必须跟匿名函数——它要求的是"一个函数调用表达式"，可以调用已经存在的具名函数，真实的 `errgroup.Go` 源码里 `defer g.done()` 就是调用一个现成方法，不是当场定义匿名函数。`recover()` 场景习惯写 `defer func(){...}()`，只是因为需要一段"这里专属、别处用不到"的逻辑，只能当场写。
+
+### 为什么 `recover()` 能接住 panic——退栈机制 + 图书馆比喻
+
+`panic()` 触发后，Go 不是瞬间让程序消失，而是开始"退栈"：停止当前函数继续往下执行，但会把**已经登记好**的 `defer` 清单挨个执行一遍，再把这个"爆炸"往上一层调用者传递，一层层向上，直到某一层的 `defer` 里调用了 `recover()`（爆炸在这层被接住，不再上传，函数正常返回），或者一路传到最顶没人接住（进程真的崩溃）。
+
+**核心限制**：`defer` 必须在风险代码执行**之前**就已经登记好，不能事后补——如果把 `defer` 写在会 panic 的那行代码后面，panic 一响，代码根本执行不到那一行 `defer`，它连"登记"这一步都没发生，退栈时清单上没有它，接不住。这跟"图书馆管理员"的比喻完全对应：这个指令必须在"出事之前"先交代好("不管等会发生什么，关门前必须做 XX")，不能等出事以后才现场补交代——补交代的时候已经来不及了，程序已经在往外退的路上，不会再执行后面新写的指令。
+
+### `recover` 是谁定义的、什么时候有的
+
+`recover` 和 `panic`、`defer` 一样，是 Go **语言内置**的东西（跟 `len`/`cap`/`make`/`append` 同一类），不需要 `import`，由编译器 + 运行时联合实现（编译器识别"这个 `recover()` 是不是直接写在 defer 函数里"，运行时维护"现在是不是正在退栈"这个状态）。这是 **Go 语言规范**（Go Spec，"Handling panics"一节）定义的机制，由 Go 设计团队（Robert Griesemer、Rob Pike、Ken Thompson）在 2009 年 Go 首次公开亮相时就已经定好，比 Go 1.0（2012 年）还早，属于语言"从第一天就有、之后再没大改过"的地基特性。
+
+### `recover()` 抓到的 `r` 到底是什么、怎么跟命名返回值配合——安全网比喻
+
+`r` 就是当初 `panic(v)` 里那个 `v` 原封不动地被交还——手写 `panic("boom")`，`r` 就是字符串 `"boom"`；Go 运行时自己触发的 panic（数组越界、空指针），`r` 是运行时自己拼的一个描述错误的值。类型是 `any`，拿到手通常要判断/转换。
+
+用"走钢丝 + 安全网"理解 [`safeGo`](server/internal/bff/aggregate.go)：
+
+```go
+g.Go(func() (err error) {
+    defer func() {
+        if r := recover(); r != nil {
+            err = fmt.Errorf("panic recovered: %v", r)
+        }
+    }()
+    return fn()
+})
+```
+
+- `fn()` 是走钢丝的人，正常情况下稳稳走到对岸（正常 `return`）
+- 摔下去（`fn()` panic 了）时，**提前架好**的安全网（`defer` 必须在他开始走之前就架好）接住他，`recover()` 就是"接住"这个动作
+- `func() (err error)` 里的 `err` 是提前印好、挂在安全网旁边的"事故报告表"（命名返回值）——正常情况下空白（`nil`）；真摔了，现场工作人员（`defer` 里的代码）直接在这张表上填"panic recovered: xxx"，这张表本身就是最终交出去的返回值
+- 交出去之后，调用方（`errgroup`）拿到手里的永远只是这张"事故报告表"，**分不清**这次到底是"正常业务失败"还是"真的摔下去被网救回来"——两种情况长得一模一样，都只是"这个任务返回了个 error"。这正是 `safeGo` 的意义：把"进程级灾难"伪装成"普通业务失败"
+
+### `g.Go` / `WithContext` / `errOnce`——用项目实际锁定的 `errgroup@v0.17.0` 真源码讲清楚
+
+真实源码（`/Users/welby/go/pkg/mod/golang.org/x/sync@v0.17.0/errgroup/errgroup.go`）：
+
+```go
+type Group struct {
+	cancel  func(error)
+	wg      sync.WaitGroup
+	sem     chan token
+	errOnce sync.Once
+	err     error
+}
+
+func WithContext(ctx context.Context) (*Group, context.Context) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	return &Group{cancel: cancel}, ctx
+}
+
+func (g *Group) Go(f func() error) {
+	if g.sem != nil {
+		g.sem <- token{}
+	}
+	g.wg.Add(1)
+	go func() {
+		defer g.done()
+		if err := f(); err != nil {
+			g.errOnce.Do(func() {
+				g.err = err
+				if g.cancel != nil {
+					g.cancel(g.err)
+				}
+			})
+		}
+	}()
+}
+```
+
+- **`g.Go`**：`Group` 结构体上的一个方法，不是语言内置，是第三方（严格说是"Go 官方扩展库"）代码。内部就是 `wg.Add(1)` → 起新 goroutine → 跑 `f()` → 有 error 就记下来。
+- **`WithContext`**：创建 `Group` 的同时，用 `context.WithCancelCause` 派生一个新 `ctx`，把取消函数存进 `Group.cancel`——以后任何任务失败，自动调用这个 `cancel`，让所有拿着这个派生 `ctx` 的兄弟任务能感知到"该收工了"。
+- **`errOnce`**：**不是方法，是一个字段**，类型是标准库 `sync.Once`。`.Do(func(){...})` 才是方法，这个方法由 **Go 标准库 `sync` 包**定义，`errgroup` 只是用它保证"多个 goroutine 同时出错时，只有第一个 error 会被真正记录"，线程安全。
+
+**官方源码里明确写了"故意不做 panic 自动恢复"的理由**（`errgroup.go:81-91` 的注释）：把 panic 自动转成 error 会让 bug 被延迟发现、把清晰的崩溃堆栈藏成一个普通值（监控工具抓不到）、还可能造成死锁掩盖真正的 panic——所以 Go 团队**主动选择不做**这层防护，把"要不要拦 panic"这个决定完全留给使用者，这正是为什么本项目要自己加一层 `safeGo`。
+
+### errgroup 像不像 `Promise.all`——像，但取消机制是关键差异
+
+相似点：都是"并发跑几个任务、等结果、第一个失败的被特殊对待"。
+
+不同点：
+- `Promise.all` 一个 reject 就立刻返回，**但其他 promise 该跑还跑**——JS 原生 Promise 没有真正的取消能力
+- `errgroup.Wait()` **不会提前返回**，内部 `g.wg.Wait()` 必须等所有 goroutine 真正结束才往下走；它做的是把"取消信号"广播出去（等价于我们聊过的 `AbortController`/`signal` 那套广播模型），但信号能不能让任务真正提前停，取决于任务代码有没有认真监听 `ctx.Done()`
+- 更精确地说：errgroup "等所有人结束"这个行为更像 `Promise.allSettled`；"只关心第一个 error"这一点像 `Promise.all`；而它带的**真正取消传播**（`ctx` 广播），是 JS 原生 Promise 完全没有的东西
+
+### `error` 和 `panic` 不是同一维度的东西，不能都叫"structure"
+
+- **`error` 是接口(interface)**，不是 struct：`type error interface { Error() string }`，任何实现了 `Error() string` 方法的类型都自动满足这个接口。真正装数据的是各种**实现了这个接口的 struct**（如 `errors.New` 返回的 `*errors.errorString`）
+- **`panic` 是内置函数**，不是数据结构——是"发起一次退栈"这个动作本身。它接收的参数 `v` 可以是任意类型（字符串、`error`、自定义 struct），`v` 才是数据，`panic` 只是拿着 `v` 去触发退栈的那个动词
+
+### Go 的"库分层"体系——回答"是不是都得用第三方库"
+
+| 层级 | 例子 | 要不要额外 `go get` |
+|---|---|---|
+| 语言内置 | `panic`/`recover`/`defer` | 不用，写代码就有 |
+| 标准库（装完 Go 自带） | `fmt`、`net/http`、`context`、`sync` | 不用，`import` 直接用 |
+| Go 官方"扩展库"（`golang.org/x/...`） | `errgroup`、`x/text`、`x/net` | 要，但维护方是 Go 团队自己 |
+| 真正第三方（社区维护） | `gin`、`gorm` | 要，维护方跟 Google/Go 团队无关 |
+
+`errgroup` 属于第三档：技术上要显式拉依赖（这个项目 `go.mod` 里能看到），但严格说不算"第三方"——是 Go 团队自己维护，只是设计还在演进、还没到"进标准库后几十年不能改"的稳定程度（跟前面"[为什么这些基础功能拖到 2024 年才加进标准库](NOTES.md)"是同一套逻辑），所以故意放在 `x/` 底下单独发版。
+
+### `safeGo` 是谁写的
+
+[`safeGo`](server/internal/bff/aggregate.go) 是这个项目自己的代码，不属于 Go 语言、标准库，也不属于 `errgroup`——是在搭这个 BFF demo 时专门写的、小写字母开头（未导出）的辅助函数，只在 `bff` 包内部使用，因为 `errgroup` 官方明确决定不做 panic 兜底，所以项目自己在它外面补了这一层。
+
+## `sync.Once` 内部机制、结构化类型、TS 擦除、错误链——概念答疑合集
+
+### `sync.Once.Do(fn)`：为什么不能"第一个人吃到一半就广播说没了"
+
+`sync.Once` 内部大致是一个 `done uint32`（原子标记）+ 一个 `m sync.Mutex`：
+
+```go
+func (o *Once) Do(f func()) {
+    if atomic.LoadUint32(&o.done) == 0 {
+        o.doSlow(f)
+    }
+}
+
+func (o *Once) doSlow(f func()) {
+    o.m.Lock()
+    defer o.m.Unlock()
+    if o.done == 0 {
+        defer atomic.StoreUint32(&o.done, 1)
+        f()
+    }
+}
+```
+
+后来者不是"排队等一个通知",是**卡在 `o.m.Lock()` 这把锁上**——第一个人进 `doSlow` 时已经把锁攥在手里,直到 `f()` 完全跑完（连同 `defer` 里标记 `done=1`）才释放。所以"第一个人吃到一半"这个阶段,后面的人**压根还没资格被通知"没了"**,因为他们此刻正卡在锁外面,连查 `done` 的机会都没有。
+
+这不是设计疏忽,是**故意的保证**：`Do()` 返回 ⇒ `f()` 已经彻底跑完。`sync.Once` 最常见的用途是"懒加载单例"（比如"第一次用到才初始化一个全局连接池"），如果允许"半路广播'别等了'",所有后来者会在 `f()` 还没初始化完时就以为"已经好了"直接往下用,读到一个还没初始化完的半成品——这比"多等一下"严重得多。
+
+`errgroup` 里 `errOnce.Do(func(){ g.err = err; g.cancel(g.err) })` 能做到"第一个失败的任务几乎瞬间通知所有兄弟 goroutine 退出",靠的不是 `sync.Once` 本身变快了,而是**在这个"只跑一次"的函数体内部,手动调用了 `cancel()`**——`cancel()` 走的是完全独立的通道（关闭 `ctx.Done()` 这个 channel）,不受 `Once` 内部那把锁影响。这是 Go 的一贯设计哲学：`sync.Once`（保证"恰好一次"）和 `context`（广播取消信号）是两个各自专注、正交的小工具，组合起来用，而不是让一个复杂原语同时干两件事。
+
+### 结构化类型（Go、TS）vs 名义类型（Java、C#）——两条不同的轴，别混在一起比
+
+Go 和 TypeScript 都允许**隐式满足接口**：不用写 `implements`，只要方法/属性的"形状"对上就算数。Java/C# 必须显式声明 `implements Xxx`。
+
+但这只是**其中一条轴**,还有第二条轴容易被混在一起：
+
+| | 显式声明轴：要不要写 `implements` | 运行时存在轴：这个"接口"运行时还在不在 |
+|---|---|---|
+| Go | 不需要（结构化） | **在**——可以用 `x.(SomeInterface)` 类型断言、反射查 |
+| TypeScript | 不需要（结构化） | **完全不在**——`tsc` 编译后 `interface` 100% 被擦除，JS 里查无此物 |
+| Java / C# | 需要（名义化） | 在——可以用 `instanceof`/`is` 查 |
+
+所以准确说法是：**Go 和 TS 在"要不要显式声明"这条轴上站在一边，Java/C# 是这条轴上的异类；但在"运行时存不存在"这条轴上，TS 才是真正的异类，Go 反而和 Java/C# 站一边**。不能笼统地说"TS 是异类，Go 常规"——要看比的是哪条轴。
+
+**两者选结构化类型的动机完全不同，不是"Go 向 TS 看齐"**（Go 语言设计在 2007-2009 年就定型，TypeScript 2012 年才发布，时间线上 Go 不可能借鉴还不存在的 TS）：
+
+- **Go 的动机**：允许"事后补充满足关系"——不用改动已有类型（尤其是第三方包里的类型）就能让它满足一个新接口，这对写测试（消费方自己定义一个只含所需方法的最小接口）、解耦调用方与实现方极其重要；同时契合 Go"没有 class、没有继承"的整体设计哲学，避免 Java 式的大量样板代码。
+- **TS 的动机**：JS 里早就存在大量没有 class 的原生对象字面量（`{x:1,y:2}`），TS 的任务是"给已经存在的、无类型的 JS 代码打类型补丁"——如果用名义类型，这些字面量根本无类型可归属，结构化类型是唯一行得通的方案。
+
+"Java/C# 才是真正的后端语言，Go 反而向前端看齐"这个前提本身也不成立：后端/前端属性和名义/结构化类型选择没有任何因果关系，只是四种语言各自独立做出的设计取舍，凑巧 Go 和 TS 在其中一条轴上重合了而已。
+
+### TypeScript 编译时擦除——基本正确，有一个例外
+
+`interface`、类型标注、泛型、type-only import 这些 TS 专属语法，被 `tsc` 编译后**在生成的 JS 里完全不存在**——这个理解是对的。具体带来的好处，比"培养编码习惯"更精确：
+
+1. **编译期抓 bug**：类型不匹配在写代码的时候就报错，不用等运行时炸出来。
+2. **IDE 工具能力**：编辑器能基于静态的"形状"信息做自动补全、跳转定义、重构安全检查。
+3. **不会腐烂的文档**：类型标注本身会被编译器强制检查，代码改了但注释忘记同步这种"文档撒谎"的情况，类型标注不会发生（改了实现但类型没跟着改，编译直接报错）。
+
+**唯一的例外**：非 `const` 的 `enum` 不会被完全擦除，会生成一段真实的、运行时存在的 JS 代码（一个双向映射对象）：
+
+```ts
+enum Color { Red, Green }
+```
+
+编译后大致变成：
+
+```js
+var Color;
+(function (Color) {
+    Color[Color["Red"] = 0] = "Red";
+    Color[Color["Green"] = 1] = "Green";
+})(Color || (Color = {}));
+```
+
+所以"TS 专属语法运行时都不存在"不是 100% 绝对——`const enum` 才会被完全内联擦除，普通 `enum` 是个例外。
+
+### 错误链：`wrapError` / `Unwrap()` / `errors.Is` / `errors.As` 到底怎么顺藤摸瓜
+
+**场景**：数据库层返回一个哨兵错误，repository 层包一层，service 层再包一层：
+
+```go
+func queryDB() error { return sql.ErrNoRows }
+
+func getUserRepo() error {
+    if err := queryDB(); err != nil {
+        return fmt.Errorf("query user: %w", err) // 第一层包装
+    }
+    return nil
+}
+
+func getUserService() error {
+    if err := getUserRepo(); err != nil {
+        return fmt.Errorf("get profile: %w", err) // 第二层包装
+    }
+    return nil
+}
+
+// errors.Is(getUserService(), sql.ErrNoRows) // true —— 三层包装之后依然能查到最初的错误
+```
+
+**`fmt.Errorf(..., %w, err)` 真实生成的类型**（`fmt` 包源码）：
+
+```go
+type wrapError struct {
+    msg string // 给人看的、已经拼好的完整文字
+    err error  // 给程序判断用的、指向"下一环"的真实值（指针）
+}
+
+func (e *wrapError) Error() string { return e.msg }
+func (e *wrapError) Unwrap() error { return e.err } // 关键就这一个方法
+```
+
+三层包装后的链条，画出内存结构：
+
+```
+err（最外层）
+  → *wrapError{ msg: "get profile: query user: sql: no rows in result set",
+                err: → *wrapError{ msg: "query user: sql: no rows in result set",
+                                    err: → sql.ErrNoRows（链条终点：没有 Unwrap 方法）
+                }
+    }
+```
+
+`msg` 是拼死的字符串，本身没有"层"的概念，查不了；真正能"顺藤摸瓜"的是每一层的 `err` 指针字段——这是"给人看的描述"（`msg`）和"给程序判断身份用的引用"（`err`）两条独立通道，Go 故意把它们拆开。
+
+**类型断言基础，`x.(T)` 是什么**：`.( )` 是 Go 内置的专用语法（不是方法调用，和 `x.Method()` 只是长得像），问"`x` 背后具体存的东西，是不是满足 `T`（可以是具体类型，也可以是接口）"：
+
+```go
+s, ok := i.(string)                          // 问：i 背后是不是 string
+u, ok := err.(interface{ Unwrap() error })   // 问：err 除了 error 接口本身保证的 Error() string 之外，
+                                              // 是不是"额外"还有一个 Unwrap() error 方法
+```
+
+准确说法：`err` 已经保证有 `Error() string`，是因为它的**静态类型声明就是 `error`**，不是这句断言"查出来"的；这句断言只检查 `Unwrap() error` 这一个额外方法有没有。
+
+**`errors.Is`/`errors.As` 内部循环**（简化版，抓住核心机制）：
+
+```go
+func Is(err, target error) bool {
+    for {
+        if err == target {
+            return true
+        }
+        u, ok := err.(interface{ Unwrap() error })
+        if !ok {
+            return false // 没有 Unwrap 方法 = 链条到头，没找到
+        }
+        err = u.Unwrap() // 顺着指针走到下一环，继续循环
+    }
+}
+```
+
+真实源码还多两个分支（自定义 `Is(error) bool` 方法、`Unwrap() []error` 支持 `errors.Join` 多重包装），但核心"循环调用 Unwrap 直到匹配或到头"没变。
+
+**`%w` vs `%v`——为什么 `%v` 会让链条直接断掉**：两者打印出来的文字一模一样，区别在 `fmt.Errorf` 背后造出来的类型：
+
+```go
+errV := fmt.Errorf("query user: %v", sql.ErrNoRows) // 只把 Error() 返回的文字抄一遍，原 error 对象本身用完就扔了
+errW := fmt.Errorf("query user: %w", sql.ErrNoRows) // 文字抄一遍的同时，额外把原 error 对象的指针也存下来
+
+errors.Is(errV, sql.ErrNoRows) // false —— errV 背后的类型没有 Unwrap()，链条到此断了
+errors.Is(errW, sql.ErrNoRows) // true
+```
+
+`%v` 是"只留遗言"，`%w` 是"遗言 + 本体指针都留下，还告诉你怎么通过 `Unwrap()` 找到下一环"。
+
+**`sql.ErrNoRows` 长什么样（链条终点为什么没有 `Unwrap`）**：
+
+```go
+// database/sql
+var ErrNoRows = errors.New("sql: no rows in result set")
+
+// errors 包
+func New(text string) error { return &errorString{text} }
+type errorString struct{ s string }
+func (e *errorString) Error() string { return e.s }
+```
+
+背后是 `*errors.errorString`，只有一个字段（文字）、只实现 `Error()`，没有指向"更下一层"的字段/方法——它本来就是链条起点，没有更底层可指。
+
+### 方法"签名"完全匹配是什么意思
+
+签名 = **方法名 + 参数类型列表 + 返回值类型列表**，四样东西合在一起才算数：
+
+```go
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+```
+
+要满足这个接口，某个类型必须有一个**方法名叫 `Read`**、**接收一个 `[]byte` 参数**、**返回 `(int, error)`** 的方法——缺一不可。方法名对了但参数/返回值类型不对，不算满足这个接口。
+
+### `errors.New(...)` 在干什么、`errorString` 为什么包一层 struct + 指针
+
+```go
+var ErrNoRows = errors.New("sql: no rows in result set")
+```
+
+`errors.New` 是标准库函数：给一段文字，造一个 error 值。这是包级变量声明，包被加载时执行**一次**，造出**唯一一份** error 值，之后整个程序反复复用这同一份（不是每次现造）。`database/sql` 内部凡是"查询没返回任何行"，都返回这个**同一个**预造值，调用方可以拿它跟 `sql.ErrNoRows` 比较（`errors.Is`）来判断是不是这种特定情况。
+
+`errorString` 为什么不是直接把 error 定义成字符串类型（例如 `type MyErr string`，同样能满足 `error` 接口），而要包一层 struct 再取指针：
+
+```go
+func New(text string) error { return &errorString{text} } // 返回的是指针
+type errorString struct{ s string }
+func (e *errorString) Error() string { return e.s }
+```
+
+**原因不是"字段类型不能写 string"**（`struct{ s string }` 完全合法），而是**指针能保证每次调用产生独一无二的身份**：
+
+```go
+err1 := errors.New("boom")
+err2 := errors.New("boom")
+err1 == err2 // false —— 文字一样，但这是两个不同的指针，身份不同
+```
+
+如果用值类型字符串实现（`type MyErr string`），内容相同就会 `==` 相等——这对哨兵错误（sentinel error，靠"是不是特指这一个"做判断）是致命的：任何人手写一段相同文案的错误，都会被误判成"就是 `ErrNoRows`"。所以标准库故意选"struct + 指针"，用指针地址而不是文字内容来定义"是不是同一个错误"。
+
+`sql.ErrNoRows` 的静态类型是 `error`（接口），背后具体存的是 `*errorString`（指针），**不是字符串本身**——正因为不是裸字符串，才"有指针可挂"，才能用指针相等做精确判断；如果它真的"本来就是字符串"，反而没有这套身份机制了。
+
+### Go 的 `type` 关键字不等同于 TS 的 `interface`
+
+`type` 是 Go 里**通用的类型声明关键字**，什么类型都能声明，不专属某一种：
+
+```go
+type Point struct{ X, Y int }    // 声明一个 struct
+type Reader interface{ Read() } // 声明一个 interface
+type Handler func(w, r) error   // 声明一个函数类型
+type MyInt int                  // 给已有类型起新名字
+```
+
+真正对应 TS `interface` 的，是 `type X interface{...}` 这**一种特定写法**（`type` + `interface` 两个词组合），不是 `type` 这个关键字本身。`type X struct{...}`（比如 `errorString`）更接近 TS 里定义一个具体对象形状/`class`，跟 TS 的 `interface`（契约/形状描述）不是一回事。
+
+### Go 多返回值怎么写——`(数据, error)` 是最常见的惯用法
+
+```go
+func Divide(a, b int) (int, error) {
+    if b == 0 {
+        return 0, errors.New("division by zero") // 出错:第一个给零值,第二个给具体错误
+    }
+    return a / b, nil // 正常:第一个给真实结果,第二个给 nil
+}
+
+result, err := Divide(10, 2)
+if err != nil { /* 处理错误 */ }
+```
+
+Go 没有 try/catch，几乎所有"可能失败"的操作都靠"最后一个返回值是不是 `error`"表达成功/失败，调用方必须手动检查 `err != nil`。其他常见形式：`(min, max int)`（都不是 error）、`(int, bool)`（常见于 `v, ok := m[key]` 查 map）、`(context.Context, context.CancelFunc)`。
+
+**命名返回值**：提前在签名里给返回值起好名字并声明类型：
+
+```go
+func Divide(a, b int) (result int, err error) {
+    if b == 0 {
+        err = errors.New("division by zero") // 直接赋值,不用 return 0, err
+        return                                // 光秃秃的 return,自动带出 result、err 当前的值
+    }
+    result = a / b
+    return
+}
+```
+
+关键点：
+- `result`、`err` 是函数体内提前声明好的局部变量，函数一开始就自动初始化成各自类型的零值（`result=0`, `err=nil`），跟普通变量声明不赋值时行为一致——所以 `b==0` 分支没碰 `result`，返回的 `result` 依然是自动填上的零值 `0`，不是没定义。
+- 函数体内其他变量**没有资格**被光秃秃的 `return` 带出去，只有签名里声明过的这两个名字才算数——不是"选择性忽略别的变量"，是语法上只认这两个名字。
+- 命名返回值最大的价值是配合 `defer` 修改最终返回值（`recover()` 场景），普通函数体较长时，社区更推荐显式 `return result, err`，光秃秃的 `return` 会让人看不出这次到底返回什么，得往上翻代码找赋值语句。
+
+### `errors.Is` 判断结果"准不准"和"是不是 true"是两回事
+
+"因为 `sql.ErrNoRows` 是提前造好的唯一一份，所以只要是这个 error，`errors.Is` 就是 true"——这句话本身没错，但不能引申成"从 `database/sql` 出来的 error，`errors.Is` 一般倾向于 true"。
+
+准确说法：**只有这次真的发生了"没查到行"这个具体情况，`errors.Is(err, sql.ErrNoRows)` 才会是 true**；如果这次是别的失败（连接超时、语法错、约束冲突……），返回的根本不是这个预造值，`errors.Is` 依然是 false。"提前造好、独一无二"这件事保证的是**判断的精确性**（不会被文字相似的其他错误误判，也不会被 `%w` 包了几层影响），不是让判断结果"偏向 true"。
